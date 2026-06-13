@@ -1044,16 +1044,16 @@ async function scanWithClaude(file){
   const apiKey = getApiKey();
   if(!apiKey) throw new Error('no-key');
 
-  // JPEG圧縮（最大1600px）してbase64化
+  // 最大2048px・高品質JPEGで送信
   const compressed = await new Promise(resolve=>{
     const img=new Image(), url=URL.createObjectURL(file);
     img.onload=()=>{
-      const scale=Math.min(1600/Math.max(img.width,img.height),1);
+      const scale=Math.min(2048/Math.max(img.width,img.height),1);
       const W=Math.round(img.width*scale), H=Math.round(img.height*scale);
       const cv=document.createElement('canvas'); cv.width=W; cv.height=H;
       cv.getContext('2d').drawImage(img,0,0,W,H);
       URL.revokeObjectURL(url);
-      cv.toBlob(b=>resolve(b),'image/jpeg',0.88);
+      cv.toBlob(b=>resolve(b),'image/jpeg',0.95);
     };
     img.src=url;
   });
@@ -1072,13 +1072,39 @@ async function scanWithClaude(file){
       'anthropic-dangerous-direct-browser-access':'true',
     },
     body: JSON.stringify({
-      model:'claude-haiku-4-5-20251001',
-      max_tokens:800,
+      model:'claude-sonnet-4-6',
+      max_tokens:1024,
       messages:[{
         role:'user',
         content:[
           { type:'image', source:{ type:'base64', media_type:'image/jpeg', data:b64 } },
-          { type:'text', text:`この給与明細画像から以下のJSONを抽出してください。値がない項目はnull、数値はカンマなしの整数、年月はYYYY-MM形式、時間は"156:00"形式の文字列で返してください。JSONのみ返してください。
+          { type:'text', text:`この画像は日本の給与明細です。表の数値を正確に読み取り、以下のJSONフォーマットのみで返してください。
+
+抽出するフィールド：
+- ym: 支給年月（YYYY-MM形式の文字列）
+- gross: 総支給額（支給合計・支給額合計）
+- ded: 控除合計額
+- net: 差引支給額（手取り・現金支給額）
+- basic: 基本給
+- otPay: 残業手当
+- hlth: 健康保険料
+- pnsn: 厚生年金保険料
+- empIns: 雇用保険料
+- incTax: 所得税
+- resTax: 住民税
+- wDays: 出勤日数（小数可、数値）
+- pDays: 有休日数（小数可、数値）
+- wHours: 勤務時間（"156:00"形式の文字列）
+- otHours: 残業時間（"5:00"形式の文字列）
+- spLeave: 特別休暇日数（数値）
+- bankXfr: 銀行振込額
+- cashPay: 現金支給額
+
+ルール：
+・数値はカンマなしの整数で返す（例：353412）
+・項目が見つからない場合はnull
+・JSONのみ返す（説明文不要）
+
 {"ym":null,"gross":null,"ded":null,"net":null,"basic":null,"otPay":null,"hlth":null,"pnsn":null,"empIns":null,"incTax":null,"resTax":null,"wDays":null,"pDays":null,"wHours":null,"otHours":null,"spLeave":null,"bankXfr":null,"cashPay":null}` }
         ]
       }]
