@@ -857,13 +857,12 @@ const z2h = s => s
   .replace(/[０-９]/g,d=>String.fromCharCode(d.charCodeAt(0)-0xFEE0))
   .replace(/，/g,',').replace(/￥/g,'¥').replace(/　/g,' ');
 
-/* 画像前処理：グレースケール＋コントラスト強化でOCR精度を上げる */
+/* 画像前処理：グレースケール＋コントラスト強化 */
 function preprocessImage(file){
   return new Promise(resolve=>{
     const img=new Image();
     const url=URL.createObjectURL(file);
     img.onload=()=>{
-      // 長辺2000px上限にリサイズ（小さい画像は拡大しない）
       const maxPx=2400;
       const scale=Math.min(maxPx/Math.max(img.width,img.height),2.0);
       const W=Math.round(img.width*scale), H=Math.round(img.height*scale);
@@ -871,7 +870,6 @@ function preprocessImage(file){
       cv.width=W; cv.height=H;
       const ctx=cv.getContext('2d');
       ctx.drawImage(img,0,0,W,H);
-      // グレースケール＋コントラスト1.8倍
       const id=ctx.getImageData(0,0,W,H), d=id.data;
       for(let i=0;i<d.length;i+=4){
         const g=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
@@ -887,48 +885,72 @@ function preprocessImage(file){
   });
 }
 
-function findNum(line, allowSmall){
-  const nums=z2h(line).match(/(\d{1,3}(?:,\d{3})+|\d{3,})/g);
-  if(!nums) return null;
-  let best=null;
-  const min=allowSmall?100:1000;
-  nums.forEach(x=>{const v=parseInt(x.replace(/[^0-9]/g,''),10); if(v>=min&&(best===null||v>best))best=v;});
-  return best;
+const NET_RE   = /(差引支給|現金支給|手取り?)/;
+const GROSS_RE = /(総支給(額)?|支給(額)?合計|支給計|支給総額)/;
+const DED_RE   = /(控除合計(額)?|控除額合計|控除計)/;
+
+function findNum(s){
+  const nums=(z2h(s).match(/\d{1,3}(?:,\d{3})+|\d{4,}/g)||[]).map(x=>parseInt(x.replace(/,/g,''),10));
+  const big=nums.filter(v=>v>=1000);
+  return big.length ? Math.max(...big) : null;
 }
+
 function parseSlip(text){
   const out={gross:null,ded:null,net:null,ym:null};
-  const lines=text.split(/[\n\r]+/);
-  lines.forEach(line=>{
-    const l=z2h(line);
-    // 手取り：複数の表記に対応
-    if(out.net===null && /(差引支給|差引支給額|差引(き)?支給|差引|振込(支給)?額?|銀行振込|手取り?|支給額$|実支給)/.test(l))
-      out.net=findNum(l)??out.net;
-    // 総支給
-    if(out.gross===null && /(総支給(額)?|支給額合計|支給合計|支給計|課税支給|総額|支給総額|現金支給)/.test(l))
-      out.gross=findNum(l)??out.gross;
-    // 控除
-    if(out.ded===null && /(控除合計|控除額合計|控除計|控除額|社会保険合計|天引き合計)/.test(l))
-      out.ded=findNum(l)??out.ded;
-  });
+  const t=z2h(text);
+  const lines=t.split(/[\n\r]+/).map(l=>l.trim()).filter(Boolean);
 
-  // 取れなかった場合：行の最大数値を貪欲に拾う（3項目のうち最大=総支給の可能性）
-  if(!out.gross&&!out.ded&&!out.net){
-    const candidates=[];
-    lines.forEach(line=>{const v=findNum(z2h(line),false); if(v) candidates.push(v);});
-    candidates.sort((a,b)=>b-a);
-    if(candidates[0]) out.gross=candidates[0];
-    if(candidates[1]) out.net=candidates[1];
+  /* Pass 1: キーワードと数値が同一行（横一列タイプ） */
+  for(const line of lines){
+    if(out.net===null   && NET_RE.test(line))   { const n=findNum(line); if(n) out.net=n;   }
+    if(out.gross===null && GROSS_RE.test(line)) { const n=findNum(line); if(n) out.gross=n; }
+    if(out.ded===null   && DED_RE.test(line))   { const n=findNum(line); if(n) out.ded=n;   }
   }
 
-  // 年月
-  const t=z2h(text);
+  /* Pass 2: ヘッダー行 + 値行の表形式（このアプリの明細はこちら）
+     例: "総支給額 課税支給額 控除合計額 差引支給額 銀行振込額 現金支給額"
+         "353,412  353,412   71,182    282,230    0        282,230"
+     → 列位置を対応させて抽出 */
+  for(let i=0;i<lines.length-1;i++){
+    const header=lines[i];
+    if(!(GROSS_RE.test(header)||NET_RE.test(header)||DED_RE.test(header))) continue;
+    // ヘッダー行に大きな数値が少なければ表ヘッダーと判断
+    if((header.match(/\d{4,}/g)||[]).length>2) continue;
+
+    for(let j=i+1;j<=Math.min(i+2,lines.length-1);j++){
+      const vline=lines[j];
+      // 全数値を位置ごとに抽出（0も含む→列ずれ防止）
+      const allNums=(vline.match(/\d{1,3}(?:,\d{3})*|\d+/g)||[]).map(x=>parseInt(x.replace(/,/g,''),10));
+      if(allNums.length<2) continue;
+
+      const cols=header.split(/\s+/).filter(Boolean);
+      for(let k=0;k<Math.min(cols.length,allNums.length);k++){
+        const v=allNums[k];
+        if(v<1000) continue; // 0や小数は除外
+        if(out.gross===null && GROSS_RE.test(cols[k])) out.gross=v;
+        if(out.ded===null   && DED_RE.test(cols[k]))   out.ded=v;
+        if(out.net===null   && NET_RE.test(cols[k]))   out.net=v;
+      }
+      break;
+    }
+  }
+
+  /* Pass 3: どれも取れない場合、10万以上の数値群から最大→総支給、次→手取りと推測 */
+  if(!out.gross&&!out.ded&&!out.net){
+    const big=lines.flatMap(l=>(l.match(/\d{1,3}(?:,\d{3})+|\d{5,}/g)||[]).map(x=>parseInt(x.replace(/,/g,''),10))).filter(v=>v>=10000);
+    big.sort((a,b)=>b-a);
+    if(big[0]) out.gross=big[0];
+    if(big[1]&&big[1]<big[0]) out.net=big[1];
+  }
+
+  /* 年月 */
   let m=t.match(/(20\d{2})\s*[年\/\.\-]\s*(1[0-2]|0?[1-9])/);
   if(m) out.ym=m[1]+'-'+String(m[2]).padStart(2,'0');
   else{
     m=t.match(/令和\s*(元|\d{1,2})\s*年\s*(1[0-2]|0?[1-9])\s*月/);
     if(m){ const r=m[1]==='元'?1:parseInt(m[1],10); out.ym=(2018+r)+'-'+String(m[2]).padStart(2,'0'); }
     else{
-      m=t.match(/R\s*(\d{1,2})\s*[\.\/\-]\s*(1[0-2]|0?[1-9])/);
+      m=t.match(/R\s*(\d{1,2})\s*[\.\/年\-]\s*(1[0-2]|0?[1-9])/);
       if(m) out.ym=(2018+parseInt(m[1],10))+'-'+String(m[2]).padStart(2,'0');
     }
   }
